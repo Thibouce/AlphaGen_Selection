@@ -16,7 +16,10 @@ import os
 import subprocess
 import urllib.request
 
-from chunking import legacy_chunk_starts, plan_chunks
+from comfyui_chunk_planner import AlphaChunkPlanner
+from comfyui_chunk_planner.chunking import legacy_chunk_starts, plan_chunks
+
+PLAN_OUT = {n: i for i, n in enumerate(AlphaChunkPlanner.RETURN_NAMES)}
 
 NONE_PROMPT = "builtin"
 SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
@@ -38,7 +41,7 @@ def chunk_starts(count, L, step):
 
 class Graph:
     def __init__(self):
-        self.nodes, self._n, self.label = {}, 0, ""
+        self.nodes, self._n, self.label, self.mute = {}, 0, "", False
 
     def node(self, class_type, **inputs):
         self._n += 1
@@ -46,6 +49,8 @@ class Graph:
         n = {"class_type": class_type, "inputs": inputs}
         if self.label:
             n["_meta"] = {"title": f"[{self.label}] {class_type}"}
+        if self.mute:  # emplacement de chunk inutilisé: coupé (Ctrl+M) dans l'éditeur, absent du graphe envoyé à /prompt
+            n.setdefault("_meta", {})["muted"] = True
         self.nodes[nid] = n
         return Out(nid)
 
@@ -75,6 +80,11 @@ def build(a):
     best = a.quality == "best"
     prefix = a.prefix + ("_preview" if a.render == "preview" else "")
     last = start + count - 1
+    slots = a.planner or len(starts)
+    if a.planner and a.legacy_chunks:
+        raise SystemExit("--planner est incompatible avec --legacy-chunks")
+    if len(starts) > slots:
+        raise SystemExit(f"{len(starts)} chunks > {slots} emplacements (--planner)")
 
     g = Graph()
     # --- source de la plaque (remplaçable par Load Plate Sequence, etc.) ---
@@ -82,6 +92,16 @@ def build(a):
     load = g.node("LoadVideo", file=a.video)
     comps = g.node("GetVideoComponents", video=load.out(0))
     src = comps.out(0)
+
+    # --- planificateur: les widgets qui dépendent de la durée sont reliés à ses sorties ---
+    pl = None
+    if a.planner:
+        g.label = "Plan"
+        pl = g.node("AlphaChunkPlanner", start=start, chunk=a.chunk, overlap=a.overlap, mode=a.chunk_mode,
+                    render="preview chunk" if a.render == "preview" else "full shot", images=src)
+
+    def V(name, literal):
+        return [pl.nid, PLAN_OUT[name]] if pl else literal
 
     g.label = "SAM3"
     vid = g.node("ComfyProAlpha_LoadVideo", images=src, fps=fps)
@@ -91,9 +111,9 @@ def build(a):
         seg = g.node("SAM3VideoSegmentation", video=vid.out(0), prompt_mode=mode, frame_idx=int(frame),
                      score_threshold=a.sam3_threshold, **prompt)
         prop = g.node("SAM3Propagate", sam3_model_config=sam.out(0), video_state=seg.out(0),
-                      start_frame=int(frame), end_frame=last, direction="forward")
-        return g.node("ComfyProAlpha_TrackMasks", masks=prop.out(0), start=start, count=count,
-                      width=W, height=H).out(0)
+                      start_frame=int(frame), end_frame=V("last_frame", last), direction="forward")
+        return g.node("ComfyProAlpha_TrackMasks", masks=prop.out(0), start=V("start", start), count=V("count", count),
+                      width=V("width", W), height=V("height", H)).out(0)
 
     def box_track(b):
         cx, cy, w, h = b["box"]
@@ -123,7 +143,7 @@ def build(a):
                                    ("cuts", union([point_track(x) for x in ok(p.get("cuts", []))])),
                                    ("others", union([box_track(x) for x in ok(p.get("others", []))]))) if v is not None}
     g.label = "Refine"
-    plate = g.node("ComfyProAlpha_Plate", images=src, start=start, count=count)
+    plate = g.node("ComfyProAlpha_Plate", images=src, start=V("start", start), count=V("count", count))
     ref = g.node("ComfyProAlpha_Refine", plate=plate.out(0), target=target, vitmatte=a.vitmatte,
                  erode=a.erode, dilate=a.dilate, radius=a.stabilize_radius, **refine_kw)
     sel, refined, others = ref.out(0), ref.out(1), ref.out(2)
@@ -148,8 +168,9 @@ def build(a):
                       negative=g.node("CLIPTextEncode", clip=clip.out(0), text="").out(0), frame_rate=fps)
     vae = g.node("VAELoader", vae_name=a.video_vae)
     avae = g.node("VAELoader", vae_name=a.audio_vae)
-    latent = g.node("EmptyLTXVLatentVideo", width=W + (-W) % 32, height=H + (-H) % 32, length=L, batch_size=1)
-    alat = g.node("LTXVEmptyLatentAudio", frames_number=L, frame_rate=int(round(fps)), batch_size=1, audio_vae=avae.out(0))
+    latent = g.node("EmptyLTXVLatentVideo", width=V("latent_width", W + (-W) % 32), height=V("latent_height", H + (-H) % 32),
+                    length=V("length", L), batch_size=1)
+    alat = g.node("LTXVEmptyLatentAudio", frames_number=V("length", L), frame_rate=int(round(fps)), batch_size=1, audio_vae=avae.out(0))
     noise = g.node("RandomNoise", noise_seed=a.seed)
     sampler = g.node("KSamplerSelect", sampler_name="euler_ancestral")
     sigmas = g.node("ManualSigmas", sigmas=SIGMAS)
@@ -157,9 +178,11 @@ def build(a):
 
     def ltx_pass(images, name, offset=0):
         chunks = {}
-        for i, s in enumerate(starts):
-            g.label = f"LTX {name} chunk {i}"
-            img = g.node("ComfyProAlpha_ChunkPad", images=images, start=offset + s, length=L, end=offset + count)
+        for i in range(slots):
+            s = starts[min(i, len(starts) - 1)]
+            g.label, g.mute = f"LTX {name} chunk {i}", i >= len(starts)
+            img = g.node("ComfyProAlpha_ChunkPad", images=images, start=V(f"{name}{i}", offset + s), length=V("length", L),
+                         end=V("end_a" if name == "A" else "end_b", offset + count))
             guide = g.node("LTXAddVideoICLoRAGuide", positive=cond.out(0), negative=cond.out(1), vae=vae.out(0),
                            latent=latent.out(0), image=img.out(0), frame_idx=0, strength=1.0,
                            latent_downscale_factor=lora.out(1), crop="disabled", use_tiled_encode=False,
@@ -172,14 +195,14 @@ def build(a):
             crop = g.node("LTXVCropGuides", positive=guide.out(0), negative=guide.out(1), latent=sep.out(0))
             dec = g.node("ComfyProAlpha_DecodeAlpha", samples=crop.out(2), vae=vae.out(0))
             chunks[f"chunk_{i}"] = dec.out(0)
-        g.label = f"LTX {name} stitch"
-        return g.node("ComfyProAlpha_Stitch", plan=plan, **chunks).out(0)
+        g.label, g.mute = f"LTX {name} stitch", False
+        return g.node("ComfyProAlpha_Stitch", plan=V("plan", plan), **chunks).out(0)
 
     ltx = ltx_pass(src, "A", offset=start)
     final_kw = {}
     if best:
         g.label = "Isolate"
-        iso = g.node("ComfyProAlpha_Isolate", plate=src, start=start, selection=sel, others=others, grow=6, blur=6.0)
+        iso = g.node("ComfyProAlpha_Isolate", plate=src, start=V("start", start), selection=sel, others=others, grow=6, blur=6.0)
         final_kw["ltx_isolated"] = ltx_pass(iso.out(0), "B")
     g.label = "Final"
     final = g.node("ComfyProAlpha_Final", plate=plate.out(0), ltx=ltx, selection=sel, refined=refined,
@@ -206,7 +229,16 @@ def probe(path):
     return int(st["width"]), int(st["height"]), int(num) / int(den), int(n)
 
 
+def strip_muted(nodes):
+    """Graphe exécutable: sans les nodes coupés ni les liens qui y mènent (ce que fait l'éditeur à l'envoi)."""
+    gone = {k for k, n in nodes.items() if n.get("_meta", {}).get("muted")}
+    return {k: {**n, "inputs": {i: v for i, v in n["inputs"].items()
+                                if not (isinstance(v, list) and len(v) == 2 and str(v[0]) in gone)}}
+            for k, n in nodes.items() if k not in gone}
+
+
 def queue(nodes, url):
+    nodes = strip_muted(nodes)
     req = urllib.request.Request(url.rstrip("/") + "/prompt", json.dumps({"prompt": nodes}).encode(),
                                  {"Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(req))
@@ -237,6 +269,9 @@ def main():
     ap.add_argument("--chunk-mode", dest="chunk_mode", choices=["fixed", "shrink"], default="fixed",
                     help="fixed: chunks de --chunk frames, seuls leur nombre et leurs débuts s'adaptent; "
                          "shrink: raccourcit aussi la longueur des chunks (moins de frames calculées)")
+    ap.add_argument("--planner", type=int, default=0, metavar="SLOTS",
+                    help="graphe avec un node Alpha Chunk Planner et SLOTS branches de chunk par passe (max 10); "
+                         "les branches inutiles sont coupées (muted) dans l'éditeur")
     ap.add_argument("--legacy-chunks", dest="legacy_chunks", action="store_true",
                     help="ancien calcul à pas fixe (dernier chunk très recouvrant)")
     ap.add_argument("--seed", type=int, default=42)

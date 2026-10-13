@@ -63,6 +63,12 @@ KNOWN_OUT = {
 }
 
 
+try:  # le node planificateur: sorties connues (nom, type)
+    from comfyui_chunk_planner import AlphaChunkPlanner as _P
+    KNOWN_OUT["AlphaChunkPlanner"] = list(zip(_P.RETURN_NAMES, _P.RETURN_TYPES))
+except ImportError:
+    pass
+
 # Ordres d'inputs réels, relevés dans le code / les captures du node (le mode hors-ligne devine les autres).
 KNOWN_INPUT_ORDER = {
     "ComfyProAlpha_Isolate": ["plate", "selection", "others", "grow", "blur", "start"],
@@ -154,7 +160,7 @@ def convert(api, oi):
         y = colY.get(depth[nid], 0)
         colY[depth[nid]] = y + h + GAP_Y
         node = {"id": int(nid), "type": n["class_type"], "pos": [x, y], "size": [COL_W, h], "flags": {}, "order": idx,
-                "mode": 0, "inputs": ins, "outputs": outs,
+                "mode": 2 if n.get("_meta", {}).get("muted") else 0, "inputs": ins, "outputs": outs,
                 "properties": {"Node name for S&R": n["class_type"]}, "widgets_values": widgets}
         title = n.get("_meta", {}).get("title")
         if title:

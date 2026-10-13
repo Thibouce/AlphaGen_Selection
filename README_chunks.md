@@ -15,3 +15,24 @@ python api_to_editor.py workflow_api.json --url http://127.0.0.1:8188 -o workflo
 - Pour un dossier de plans (cmd): `for %f in (plans\*.mp4) do python build_workflow.py --video-path "%f" --picks "picks\%~nf.json" -o "out\%~nf.json" --queue http://127.0.0.1:8188`
 
 Le calcul des débuts est une réimplémentation, pas le `_engine.chunk_starts` d'origine.
+
+## Node ComfyUI « Alpha Chunk Planner » (travailler dans l'interface)
+
+1. Copiez le dossier `comfyui_chunk_planner/` dans `ComfyUI/custom_nodes/` et redémarrez ComfyUI
+   (catégorie *Comfy Compositing*, nom *Alpha Chunk Planner*).
+2. Branchez `images` (la plaque), réglez `start` (frame du pointage), `chunk` (longueur max), `overlap`, `mode`.
+3. Sorties: `count`, `start`, `last_frame`, `length`, `num_chunks`, `end_a`, `end_b`, `width`, `height`,
+   `latent_width`, `latent_height`, `plan` (JSON pour `Stitch`), `summary` (texte: chunks à garder / couper),
+   puis `A0..A9` (débuts des `ChunkPad` de la passe A, `start` inclus) et `B0..B9` (passe B, plaque isolée).
+4. Reliez-les aux widgets: `ChunkPad` start/length/end, `Stitch.plan`, `Plate`/`TrackMasks` start/count/width/height,
+   `SAM3Propagate.end_frame`, `EmptyLTXVLatentVideo` width/height/length, `LTXVEmptyLatentAudio.frames_number`, `Isolate.start`.
+5. Coupez (Ctrl+M) les branches de chunk d'index >= `num_chunks` (le `summary` les liste); activez-les au besoin.
+   Les emplacements inutilisés reçoivent une valeur valide (le dernier début) pour que les liens restent corrects.
+
+Un workflow déjà câblé est généré avec `--planner 10`:
+
+```
+python build_workflow.py --video-path plan.mp4 --picks picks.json --overlap 7 --planner 10 -o workflow_api.json
+python api_to_editor.py workflow_api.json --url http://127.0.0.1:8188 -o workflow_editor.json
+```
+(`workflow_editor_planner_10slots.json` en est un exemple: 133 frames, 3 chunks actifs, 7 emplacements coupés par passe.)
