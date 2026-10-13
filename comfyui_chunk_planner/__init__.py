@@ -33,7 +33,8 @@ class AlphaChunkPlanner:
     COMMON = [("count", "INT"), ("start", "INT"), ("last_frame", "INT"), ("length", "INT"), ("num_chunks", "INT"),
               ("end_a", "INT"), ("end_b", "INT"), ("width", "INT"), ("height", "INT"),
               ("latent_width", "INT"), ("latent_height", "INT"), ("plan", "STRING"), ("summary", "STRING")]
-    OUTPUTS = COMMON + [(f"A{i}", "INT") for i in range(SLOTS)] + [(f"B{i}", "INT") for i in range(SLOTS)]
+    OUTPUTS = (COMMON + [(f"A{i}", "INT") for i in range(SLOTS)] + [(f"B{i}", "INT") for i in range(SLOTS)]
+               + [(f"on_{i}", "BOOLEAN") for i in range(SLOTS)])
     RETURN_NAMES = tuple(n for n, _ in OUTPUTS)
     RETURN_TYPES = tuple(t for _, t in OUTPUTS)
     FUNCTION = "plan"
@@ -67,8 +68,51 @@ class AlphaChunkPlanner:
                    f"Actifs: chunks 0-{k - 1}" + (f" | a couper (Ctrl+M): chunks {off[0]}-{off[-1]}" if off else ""))
         print("[AlphaChunkPlanner]", summary)
         vals = (count, start, start + count - 1, L, k, start + count, count, w, h, w + (-w) % 32, h + (-h) % 32, plan, summary)
-        return {"ui": {"text": [summary]}, "result": vals + tuple(a) + tuple(b)}
+        on = tuple(i < k for i in range(SLOTS))  # True pour les chunks à garder actifs
+        return {"ui": {"text": [summary]}, "result": vals + tuple(a) + tuple(b) + on}
 
 
-NODE_CLASS_MAPPINGS = {"AlphaChunkPlanner": AlphaChunkPlanner}
-NODE_DISPLAY_NAME_MAPPINGS = {"AlphaChunkPlanner": "Alpha Chunk Planner"}
+class AlphaStitchAuto:
+    """Remplace ComfyProAlpha_Stitch dans le workflow décomposé: reçoit les SLOTS sorties de chunk, mais
+    n'évalue que les `num_chunks` premières (entrées « lazy »). Les branches des chunks suivants ne sont
+    jamais exécutées: plus besoin de les couper à la main. Le node se développe ensuite en vrai
+    ComfyProAlpha_Stitch relié aux seuls chunks utiles."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "plan": ("STRING", {"forceInput": True}),
+                "num_chunks": ("INT", {"forceInput": True, "default": 1, "min": 1, "max": SLOTS}),
+            },
+            "optional": {f"chunk_{i}": ("*", {"lazy": True}) for i in range(SLOTS)},
+            "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("alpha",)
+    FUNCTION = "stitch"
+    CATEGORY = "Comfy Compositing"
+
+    @staticmethod
+    def _linked(dynprompt, unique_id):
+        ins = dynprompt.get_node(unique_id)["inputs"]
+        return {k for k, v in ins.items() if isinstance(v, list) and len(v) == 2}
+
+    def check_lazy_status(self, plan, num_chunks, dynprompt=None, unique_id=None, **kw):
+        linked = self._linked(dynprompt, unique_id)
+        return [f"chunk_{i}" for i in range(num_chunks) if f"chunk_{i}" in linked and kw.get(f"chunk_{i}") is None]
+
+    def stitch(self, plan, num_chunks, dynprompt=None, unique_id=None, **kw):
+        from comfy_execution.graph_utils import GraphBuilder  # importé ici: absent hors de ComfyUI
+        inputs = dynprompt.get_node(unique_id)["inputs"]
+        missing = [f"chunk_{i}" for i in range(num_chunks) if f"chunk_{i}" not in self._linked(dynprompt, unique_id)]
+        if missing:
+            raise ValueError(f"AlphaStitchAuto: {num_chunks} chunks prévus, entrées non branchées: {', '.join(missing)}")
+        g = GraphBuilder()
+        st = g.node("ComfyProAlpha_Stitch", plan=plan, **{f"chunk_{i}": inputs[f"chunk_{i}"] for i in range(num_chunks)})
+        return {"result": (st.out(0),), "expand": g.finalize()}
+
+
+NODE_CLASS_MAPPINGS = {"AlphaChunkPlanner": AlphaChunkPlanner, "AlphaStitchAuto": AlphaStitchAuto}
+NODE_DISPLAY_NAME_MAPPINGS = {"AlphaChunkPlanner": "Alpha Chunk Planner", "AlphaStitchAuto": "Alpha Stitch Auto (lazy)"}

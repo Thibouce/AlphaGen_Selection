@@ -36,3 +36,13 @@ python build_workflow.py --video-path plan.mp4 --picks picks.json --overlap 7 --
 python api_to_editor.py workflow_api.json --url http://127.0.0.1:8188 -o workflow_editor.json
 ```
 (`workflow_editor_planner_10slots.json` en est un exemple: 133 frames, 3 chunks actifs, 7 emplacements coupés par passe.)
+
+## Chunks inutiles sautés automatiquement (sans Ctrl+M)
+
+- `Alpha Chunk Planner` sort aussi `on_0..on_9` (BOOLEAN): `True` pour les chunks à garder. Ce sont des valeurs, pas des états
+  mute/bypass: ComfyUI ne permet pas de couper un node depuis une valeur calculée.
+- `Alpha Stitch Auto (lazy)` remplace `ComfyProAlpha_Stitch`: ses entrées `chunk_0..chunk_9` sont « lazy », il ne demande que
+  les `num_chunks` premières. Les branches suivantes ne sont jamais exécutées, puis le node se développe en vrai `Stitch`.
+  Branchez `plan` et `num_chunks` sur le planificateur.
+- Workflow d'exemple: `workflow_editor_planner_auto.json` (`--planner 10 --auto-skip`): 10 branches par passe, aucune coupée.
+  Non testé dans ComfyUI: si ça échoue, utilisez la version à branches coupées (`--planner 10`, sans `--auto-skip`).

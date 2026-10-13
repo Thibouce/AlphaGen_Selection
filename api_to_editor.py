@@ -32,7 +32,7 @@ def kind(v):
         return "COMBO", t, cfg, True
     if t == "COMBO":
         return "COMBO", cfg.get("options", []), cfg, True
-    return t, None, cfg, t in PRIMS
+    return t, None, cfg, t in PRIMS and not cfg.get("forceInput")
 
 
 def default(t, opts, cfg):
@@ -65,9 +65,12 @@ KNOWN_OUT = {
 
 try:  # le node planificateur: sorties connues (nom, type)
     from comfyui_chunk_planner import AlphaChunkPlanner as _P
+    from comfyui_chunk_planner import AlphaStitchAuto as _S
     KNOWN_OUT["AlphaChunkPlanner"] = list(zip(_P.RETURN_NAMES, _P.RETURN_TYPES))
+    KNOWN_OUT["AlphaStitchAuto"] = [("alpha", "*")]
+    KNOWN_IN = {"AlphaStitchAuto": {**_S.INPUT_TYPES()["required"], **_S.INPUT_TYPES()["optional"]}}
 except ImportError:
-    pass
+    KNOWN_IN = {}
 
 # Ordres d'inputs réels, relevés dans le code / les captures du node (le mode hors-ligne devine les autres).
 KNOWN_INPUT_ORDER = {
@@ -99,6 +102,9 @@ def offline_object_info(api):
             else:
                 e["input"]["required"][k] = ["STRING", {"video_upload": True} if n["class_type"] == "LoadVideo" else {}]
     for ct, e in oi.items():
+        for k, spec in KNOWN_IN.get(ct, {}).items():  # définitions exactes des nodes de ce dépôt
+            if k in e["input"]["required"]:
+                e["input"]["required"][k] = list(spec)
         order = KNOWN_INPUT_ORDER.get(ct)
         if order:
             req = e["input"]["required"]

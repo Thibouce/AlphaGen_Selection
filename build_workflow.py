@@ -81,6 +81,8 @@ def build(a):
     prefix = a.prefix + ("_preview" if a.render == "preview" else "")
     last = start + count - 1
     slots = a.planner or len(starts)
+    if a.auto_skip and not a.planner:
+        raise SystemExit("--auto-skip demande --planner")
     if a.planner and a.legacy_chunks:
         raise SystemExit("--planner est incompatible avec --legacy-chunks")
     if len(starts) > slots:
@@ -180,7 +182,7 @@ def build(a):
         chunks = {}
         for i in range(slots):
             s = starts[min(i, len(starts) - 1)]
-            g.label, g.mute = f"LTX {name} chunk {i}", i >= len(starts)
+            g.label, g.mute = f"LTX {name} chunk {i}", i >= len(starts) and not a.auto_skip
             img = g.node("ComfyProAlpha_ChunkPad", images=images, start=V(f"{name}{i}", offset + s), length=V("length", L),
                          end=V("end_a" if name == "A" else "end_b", offset + count))
             guide = g.node("LTXAddVideoICLoRAGuide", positive=cond.out(0), negative=cond.out(1), vae=vae.out(0),
@@ -196,6 +198,8 @@ def build(a):
             dec = g.node("ComfyProAlpha_DecodeAlpha", samples=crop.out(2), vae=vae.out(0))
             chunks[f"chunk_{i}"] = dec.out(0)
         g.label, g.mute = f"LTX {name} stitch", False
+        if a.auto_skip and pl:
+            return g.node("AlphaStitchAuto", plan=V("plan", plan), num_chunks=V("num_chunks", len(starts)), **chunks).out(0)
         return g.node("ComfyProAlpha_Stitch", plan=V("plan", plan), **chunks).out(0)
 
     ltx = ltx_pass(src, "A", offset=start)
@@ -272,6 +276,9 @@ def main():
     ap.add_argument("--planner", type=int, default=0, metavar="SLOTS",
                     help="graphe avec un node Alpha Chunk Planner et SLOTS branches de chunk par passe (max 10); "
                          "les branches inutiles sont coupées (muted) dans l'éditeur")
+    ap.add_argument("--auto-skip", dest="auto_skip", action="store_true",
+                    help="avec --planner: remplace Stitch par 'Alpha Stitch Auto (lazy)'; les chunks inutiles ne sont jamais "
+                         "exécutés, aucune branche à couper")
     ap.add_argument("--legacy-chunks", dest="legacy_chunks", action="store_true",
                     help="ancien calcul à pas fixe (dernier chunk très recouvrant)")
     ap.add_argument("--seed", type=int, default=42)
