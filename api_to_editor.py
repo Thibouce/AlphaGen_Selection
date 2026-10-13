@@ -63,6 +63,15 @@ KNOWN_OUT = {
 }
 
 
+# Ordres d'inputs réels, relevés dans le code / les captures du node (le mode hors-ligne devine les autres).
+KNOWN_INPUT_ORDER = {
+    "ComfyProAlpha_Isolate": ["plate", "selection", "others", "grow", "blur", "start"],
+    "ComfyProAlpha_ChunkPad": ["images", "start", "length", "end"],
+    "ComfyProAlpha_Final": ["plate", "ltx", "selection", "refined", "others", "ltx_isolated", "near_px",
+                            "filename_prefix", "format", "first_frame", "save", "qc", "comp"],
+}
+
+
 def offline_object_info(api):
     """Définitions déduites du workflow API lui-même (ordre des inputs = ordre d'appel dans le node).
     Moins fiable qu'/object_info: l'ordre des widgets des nodes SAM3 / ComfyProAlpha_* est supposé."""
@@ -84,6 +93,10 @@ def offline_object_info(api):
             else:
                 e["input"]["required"][k] = ["STRING", {"video_upload": True} if n["class_type"] == "LoadVideo" else {}]
     for ct, e in oi.items():
+        order = KNOWN_INPUT_ORDER.get(ct)
+        if order:
+            req = e["input"]["required"]
+            e["input"]["required"] = {k: req[k] for k in order if k in req} | {k: v for k, v in req.items() if k not in order}
         outs = KNOWN_OUT.get(ct) or [(f"out{i}", "*") for i in range(e.pop("used", 0))]
         e.pop("used", None)
         e["output_name"], e["output"] = [o[0] for o in outs], [o[1] for o in outs]

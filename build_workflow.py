@@ -6,11 +6,17 @@ Reprend ligne à ligne ComfyProAlphaGenerator.execute() : SAM3 -> Plate/Refine -
 sur les versions récentes) pour être modifié node par node.
 
 Exemple :
-  python build_workflow.py --video plate.mp4 --frames 120 --width 1920 --height 1080 --picks picks.json -o workflow_api.json
+  python build_workflow.py --video-path C:/plans/plate.mp4 --picks picks.json -o workflow_api.json
+  (frames, taille et fps sont lus dans la vidéo; --frames/--width/--height/--fps les remplacent)
 """
 import argparse
 import json
 import math
+import os
+import subprocess
+import urllib.request
+
+from chunking import legacy_chunk_starts, plan_chunks
 
 NONE_PROMPT = "builtin"
 SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
@@ -57,10 +63,13 @@ def build(a):
     W, H, fps = a.width, a.height, a.fps
     start = int(p["target"]["frame"])
     count = a.frames - start
-    L = min(a.chunk, ltx_frames(count) if count >= a.chunk else 8 * math.ceil((count - 1) / 8) + 1)
     if a.render == "preview":
-        count = min(count, L)
-    starts = chunk_starts(count, L, max(1, L - a.overlap))
+        count = min(count, a.chunk)
+    if a.legacy_chunks:
+        L = min(a.chunk, ltx_frames(count))
+        starts = legacy_chunk_starts(count, L, max(1, L - a.overlap))
+    else:
+        L, starts = plan_chunks(count, a.chunk, a.overlap, a.chunk_mode == "shrink")
     if len(starts) > 24:
         raise SystemExit(f"{len(starts)} chunks (max 24): baisser --overlap ou couper le plan")
     best = a.quality == "best"
@@ -181,13 +190,36 @@ def build(a):
     return g.nodes
 
 
+def probe(path):
+    """Largeur, hauteur, fps et nombre de frames d'une vidéo (ffprobe)."""
+    def run(extra):
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", *extra, "-show_entries",
+                              "stream=width,height,r_frame_rate,nb_frames,nb_read_frames", "-of", "json", path],
+                             capture_output=True, text=True, check=True).stdout
+        return json.loads(out)["streams"][0]
+    st = run([])
+    n = st.get("nb_frames")
+    if not n or n == "N/A":
+        st = run(["-count_frames"])  # décode tout le flux: plus lent mais exact
+        n = st.get("nb_read_frames")
+    num, den = st["r_frame_rate"].split("/")
+    return int(st["width"]), int(st["height"]), int(num) / int(den), int(n)
+
+
+def queue(nodes, url):
+    req = urllib.request.Request(url.rstrip("/") + "/prompt", json.dumps({"prompt": nodes}).encode(),
+                                 {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--video", default="plate.mp4", help="fichier dans ComfyUI/input")
-    ap.add_argument("--frames", type=int, required=True, help="nombre total de frames de la plaque")
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--fps", type=float, default=24.0)
+    ap.add_argument("--video", help="nom du fichier dans ComfyUI/input (défaut: nom de --video-path)")
+    ap.add_argument("--video-path", dest="video_path", help="chemin local de la vidéo: frames, taille et fps sont lus avec ffprobe")
+    ap.add_argument("--frames", type=int, help="nombre total de frames (sinon lu avec ffprobe)")
+    ap.add_argument("--width", type=int, help="largeur de la plaque (sinon lue avec ffprobe)")
+    ap.add_argument("--height", type=int, help="hauteur de la plaque (sinon lue avec ffprobe)")
+    ap.add_argument("--fps", type=float, help="fps (sinon lu avec ffprobe, 24 par défaut)")
     ap.add_argument("--first-frame", dest="first_frame", type=int, default=1001)
     ap.add_argument("--picks", help="JSON du picker: {target:{frame,x,y|box}, adds, cuts, others}")
     ap.add_argument("--quality", choices=["best", "fast"], default="best")
@@ -200,8 +232,13 @@ def main():
     ap.add_argument("--video-vae", default="ltx-2.5-video-vae-conv-bf16.safetensors")
     ap.add_argument("--audio-vae", default="ltx-2.5-audio-vae-bf16.safetensors")
     ap.add_argument("--vitmatte", default="auto-download")
-    ap.add_argument("--chunk", type=int, default=49)
-    ap.add_argument("--overlap", type=int, default=9)
+    ap.add_argument("--chunk", type=int, default=49, help="longueur MAX d'un chunk (8k+1, 9..145)")
+    ap.add_argument("--overlap", type=int, default=9, help="recouvrement MIN entre chunks voisins")
+    ap.add_argument("--chunk-mode", dest="chunk_mode", choices=["fixed", "shrink"], default="fixed",
+                    help="fixed: chunks de --chunk frames, seuls leur nombre et leurs débuts s'adaptent; "
+                         "shrink: raccourcit aussi la longueur des chunks (moins de frames calculées)")
+    ap.add_argument("--legacy-chunks", dest="legacy_chunks", action="store_true",
+                    help="ancien calcul à pas fixe (dernier chunk très recouvrant)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--erode", type=int, default=10)
     ap.add_argument("--dilate", type=int, default=15)
@@ -211,11 +248,23 @@ def main():
     ap.add_argument("--no-fast-attention", action="store_true")
     ap.add_argument("--no-comp", dest="comp", action="store_false", help="ne pas construire l'image comp")
     ap.add_argument("-o", "--output", default="workflow_api.json")
+    ap.add_argument("--queue", metavar="URL", help="envoie aussi le graphe à ComfyUI (ex. http://127.0.0.1:8188)")
     a = ap.parse_args()
+    if a.video_path:
+        w, h, fps, n = probe(a.video_path)
+        a.width, a.height, a.fps, a.frames = a.width or w, a.height or h, a.fps or fps, a.frames or n
+        a.video = a.video or os.path.basename(a.video_path)
+        print(f"vidéo: {a.width}x{a.height}, {a.fps:g} fps, {a.frames} frames")
+    a.video, a.fps = a.video or "plate.mp4", a.fps or 24.0
+    a.width, a.height = a.width or 1920, a.height or 1080
+    if not a.frames:
+        ap.error("--frames ou --video-path est requis")
     nodes = build(a)
     with open(a.output, "w") as f:
         json.dump(nodes, f, indent=2)
     print(f"{len(nodes)} nodes -> {a.output}")
+    if a.queue:
+        print("ComfyUI:", queue(nodes, a.queue))
 
 
 if __name__ == "__main__":
